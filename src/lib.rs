@@ -126,6 +126,49 @@ pub fn to_markdown_bytes(
     Ok(document_to_markdown(&to_document(bytes, format)?))
 }
 
+/// Convert a document file to one Markdown string per page. The format is
+/// detected from the file content ([`Format::from_bytes`]); the extension is
+/// the fallback for signature-less formats (CSV) and unrecognizable
+/// containers.
+///
+/// Pages follow the page boundaries the source records — explicit page
+/// breaks and the layout engine's marks — so they approximate, but do not
+/// reproduce, the pagination of a word processor. Documents with no page
+/// marks come back as a single page; the result is never empty.
+///
+/// Sources that carry layout-engine page marks (Word's
+/// `lastRenderedPageBreak`, ODT `soft-page-break`) also gain a line break
+/// there in [`to_markdown`] output: the mark replaces the word-joining
+/// nothing older conversions produced across the boundary.
+pub fn to_pages(path: impl AsRef<Path>) -> Result<Vec<String>, ConvertError> {
+    let path = path.as_ref();
+    let bytes = std::fs::read(path)?;
+    let Some(format) = Format::from_bytes(&bytes).or_else(|| Format::from_path(path)) else {
+        return Err(ConvertError::Unsupported(format!(
+            "unrecognized file content and extension: {}",
+            path.display()
+        )));
+    };
+    to_pages_bytes(&bytes, format)
+}
+
+/// Convert an in-memory document to one Markdown string per page. Pass a
+/// [`Format`] to select the parser, or `None` to detect it from the content
+/// ([`Format::from_bytes`]), which signature-less formats (CSV) have to name
+/// explicitly. See [`to_pages`] for what a page is.
+pub fn to_pages_bytes(
+    bytes: &[u8],
+    format: impl Into<Option<Format>>,
+) -> Result<Vec<String>, ConvertError> {
+    let format = resolve_format(bytes, format.into())?;
+    // PDFs paginate natively: pdf-inspector extracts each physical page.
+    if format == Format::Pdf {
+        return formats::pdf::to_pages(bytes);
+    }
+    let doc = to_document(bytes, format)?;
+    Ok(render::paginate::paginate(&doc).iter().map(document_to_markdown).collect())
+}
+
 /// Parse an in-memory document into the document model. Pass a [`Format`] to
 /// select the parser, or `None` to detect it from the content.
 ///

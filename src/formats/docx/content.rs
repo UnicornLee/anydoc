@@ -45,6 +45,10 @@ pub(super) struct Ctx<'a, 'b> {
     pub numbering: &'b Numbering,
     pub counters: &'b RefCell<Counters>,
     pub assets: &'b RefCell<AssetSink>,
+    /// Charts, SmartArt and drawn shapes rendered to PNG, keyed by the
+    /// drawing's `wp:docPr/@id`. Empty when LibreOffice is unavailable or
+    /// nothing rendered; callers then use their text-only fallback.
+    pub diagrams: &'b HashMap<String, crate::shared::diagram::DiagramSlot>,
 }
 
 impl<'a, 'b> Ctx<'a, 'b> {
@@ -59,7 +63,13 @@ impl<'a, 'b> Ctx<'a, 'b> {
             numbering: self.numbering,
             counters: self.counters,
             assets: self.assets,
+            diagrams: self.diagrams,
         }
+    }
+
+    /// The rendered image for a drawing, when rendering succeeded.
+    fn diagram(&self, doc_pr_id: &str) -> Option<&crate::shared::diagram::DiagramSlot> {
+        self.diagrams.get(doc_pr_id)
     }
 
     /// Load an internal relationship target's bytes, resolved against this
@@ -506,7 +516,15 @@ impl<'a, 'b, 'e> InlineWalker<'a, 'b, 'e> {
                 // separates the runs around it: dropping a page break
                 // outright would join the words on either side. One left at
                 // the end of a paragraph is trimmed when the block renders.
-                "br" => self.push(Inline::LineBreak),
+                // A page break is kept distinct so pagination can split
+                // here; other break types are plain line breaks.
+                "br" => match child.attr(ns::W, "type") {
+                    Some("page") => self.push(Inline::PageBreak),
+                    _ => self.push(Inline::LineBreak),
+                },
+                // Where Word last rendered a page boundary: free pagination
+                // marks in any document Word has saved.
+                "lastRenderedPageBreak" => self.push(Inline::PageBreak),
                 "cr" => self.push(Inline::LineBreak),
                 "footnoteReference" => {
                     if let Some(id) = child.attr(ns::W, "id") {
@@ -560,11 +578,25 @@ impl<'a, 'b, 'e> InlineWalker<'a, 'b, 'e> {
             return Ok(());
         }
 
-        let descr = elem
-            .first_descendant(ns::WP, "docPr")
-            .and_then(|d| d.attr(ns::WP, "descr"))
-            .map(clean_text)
-            .unwrap_or_default();
+        let doc_pr = elem.first_descendant(ns::WP, "docPr");
+        let descr =
+            doc_pr.and_then(|d| d.attr(ns::WP, "descr")).map(clean_text).unwrap_or_default();
+
+        // A picture beats a list of labels. Charts, SmartArt and drawn
+        // shapes become the PNG LibreOffice rendered for them; when no
+        // rendering exists the text-only paths below still apply.
+        if let Some(id) = doc_pr.and_then(|d| d.attr(ns::WP, "id"))
+            && let Some(slot) = self.ctx.diagram(id)
+        {
+            if let crate::shared::diagram::DiagramSlot::Primary(png) = slot {
+                let part = format!("diagram/{id}.png");
+                let asset = self.ctx.add_asset("image/png".into(), part, png)?;
+                self.push(Inline::Image { alt: descr, source: ImageSource::Asset(asset) });
+            }
+            // `Merged` shapes were already drawn into an earlier image in
+            // the same group, so they emit nothing of their own.
+            return Ok(());
+        }
 
         // Charts and SmartArt render their textual content.
         if let Some(chart_ref) = elem.first_descendant(ns::CHART, "chart")
@@ -590,18 +622,30 @@ impl<'a, 'b, 'e> InlineWalker<'a, 'b, 'e> {
             } else {
                 descr.clone()
             };
-            let source = match ole.attr_qualified(ns::R, "id") {
-                Some(rel_id) => match self.ctx.rel_part(rel_id)? {
-                    Some((part, bytes)) => Some(ImageSource::Asset(self.ctx.add_asset(
-                        "application/vnd.ms-ole-object".into(),
-                        part,
-                        &bytes,
-                    )?)),
-                    None => None,
-                },
-                None => None,
-            };
-            self.push(Inline::Image { alt, source: source.unwrap_or(ImageSource::Unavailable) });
+            // MathType / Equation 3.0 store the formula as an MTEF
+            // "Equation Native" stream inside an OLE2 compound file. Decode it to
+            // LaTeX when present, so the formula renders instead of becoming an
+            // opaque binary placeholder.
+            if let Some(rel_id) = ole.attr_qualified(ns::R, "id") {
+                if let Some((part, bytes)) = self.ctx.rel_part(rel_id)? {
+                    if let Some(tex) = crate::shared::math::decode_ole_bytes(&bytes) {
+                        if !tex.trim().is_empty() {
+                            self.push(Inline::Math(tex));
+                            return Ok(());
+                        }
+                    }
+                    self.push(Inline::Image {
+                        alt,
+                        source: ImageSource::Asset(self.ctx.add_asset(
+                            "application/vnd.ms-ole-object".into(),
+                            part,
+                            &bytes,
+                        )?),
+                    });
+                    return Ok(());
+                }
+            }
+            self.push(Inline::Image { alt, source: ImageSource::Unavailable });
             return Ok(());
         }
 

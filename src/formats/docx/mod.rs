@@ -57,6 +57,11 @@ pub fn parse(bytes: &[u8]) -> Result<Document, ConvertError> {
 
     let counters = RefCell::new(Counters::default());
     let assets = RefCell::new(AssetSink::new());
+    // Charts, SmartArt and drawn shapes have no textual representation that
+    // is worth keeping when a picture is available, so they are rendered up
+    // front. Without LibreOffice this is empty and the text-only fallbacks
+    // in `content.rs` take over.
+    let diagrams = crate::shared::diagram::render_docx_diagrams(bytes).unwrap_or_default();
 
     let footnotes_part =
         typed_part_path(&doc_rels, &main_part, rel_type::FOOTNOTES, "footnotes.xml");
@@ -70,6 +75,7 @@ pub fn parse(bytes: &[u8]) -> Result<Document, ConvertError> {
         numbering: &numbering,
         counters: &counters,
         assets: &assets,
+        diagrams: &diagrams,
     };
     let blocks = content::parse_blocks(body, &ctx)?;
 
@@ -285,6 +291,38 @@ mod tests {
             let markdown = crate::to_markdown_bytes(&bytes, crate::Format::Docx).unwrap();
             assert_eq!(markdown, expected, "body: {body}");
         }
+    }
+
+    #[test]
+    fn page_break_marks_feed_pagination() {
+        // w:br type="page" and Word's own lastRenderedPageBreak marks split
+        // pages; a column break has no pagination meaning and stays a line
+        // break.
+        let document = format!(
+            r#"<w:document {W}><w:body>
+            <w:p><w:r><w:t>Alfa</w:t><w:br w:type="page"/></w:r></w:p>
+            <w:p><w:r><w:lastRenderedPageBreak/><w:t>Beta</w:t></w:r></w:p>
+            <w:p><w:r><w:t>Gamma</w:t><w:br w:type="column"/><w:t>Delta</w:t></w:r></w:p>
+            </w:body></w:document>"#
+        );
+        let bytes = docx_parts(&[("word/document.xml", &document)]);
+        let doc = parse(&bytes).unwrap();
+        let Block::Paragraph(third) = &doc.blocks[2] else { panic!("{:?}", doc.blocks) };
+        assert!(
+            matches!(
+                third.as_slice(),
+                [crate::model::Inline::Text { .. }, crate::model::Inline::LineBreak, crate::model::Inline::Text { .. }]
+            ),
+            "a column break is a line break: {third:?}"
+        );
+
+        let pages = crate::to_pages_bytes(&bytes, crate::Format::Docx).unwrap();
+        // Alfa ends page 1; the leading mark puts Beta on page 2, where
+        // Gamma's paragraph simply continues.
+        assert_eq!(
+            pages,
+            vec!["Alfa\n".to_string(), "Beta\n\nGamma\\\nDelta\n".to_string()]
+        );
     }
 
     #[test]

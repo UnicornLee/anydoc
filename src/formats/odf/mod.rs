@@ -220,6 +220,20 @@ mod tests {
     }
 
     #[test]
+    fn soft_page_break_splits_pages() {
+        // The layout engine's soft-page-break is a free pagination mark.
+        let content = r#"<office:document-content
+            xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0"
+            xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0">
+            <office:body><office:text><text:p>Alfa<text:soft-page-break/>Beta</text:p>
+            </office:text></office:body>
+            </office:document-content>"#;
+        let bytes = odt_with_content(content);
+        let pages = crate::to_pages_bytes(&bytes, crate::Format::Odt).unwrap();
+        assert_eq!(pages, vec!["Alfa\n".to_string(), "Beta\n".to_string()]);
+    }
+
+    #[test]
     fn repeated_rows_cannot_amplify_text_beyond_the_byte_budget() {
         // H3: the slot budget alone would admit 1000 copies of a 100 KB
         // cell (~100 MB); the duplicated-bytes budget rejects it up front.

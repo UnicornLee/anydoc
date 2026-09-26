@@ -237,7 +237,7 @@ fn at_space_boundary(inlines: &[Inline], start: bool) -> bool {
                 }
                 return text.ends_with(char::is_whitespace);
             }
-            Inline::LineBreak => return true,
+            Inline::LineBreak | Inline::PageBreak => return true,
             Inline::Link { content, .. } => {
                 if inlines_are_empty(content) {
                     continue;

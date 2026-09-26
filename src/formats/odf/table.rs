@@ -150,7 +150,7 @@ fn block_bytes(blocks: &[Block]) -> u64 {
                 Inline::Math(tex) => tex.len() as u64,
                 Inline::Anchor(id) | Inline::NoteRef(id) => id.len() as u64,
                 Inline::Checkbox(_) => 3,
-                Inline::LineBreak => 1,
+                Inline::LineBreak | Inline::PageBreak => 1,
             })
             .sum()
     }

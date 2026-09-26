@@ -76,6 +76,9 @@ pub(crate) fn normalize<'a>(inlines: &'a [Inline], rc: &Ctx) -> Vec<Norm<'a>> {
             Inline::Anchor(id) => out.push(Norm::Anchor(id)),
             Inline::NoteRef(id) => out.push(Norm::NoteRef(id)),
             Inline::LineBreak => out.push(Norm::LineBreak),
+            // Markdown has no pages: a page break renders exactly like the
+            // w:br it replaces, so unpaginated output is unchanged.
+            Inline::PageBreak => out.push(Norm::LineBreak),
             Inline::Math(tex) if tex.trim().is_empty() => continue,
             Inline::Math(tex) => out.push(Norm::Math(tex.trim())),
             Inline::Checkbox(checked) => out.push(Norm::Checkbox(*checked)),

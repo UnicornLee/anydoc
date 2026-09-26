@@ -30,6 +30,27 @@ impl AssetSink {
         origin_part: String,
         bytes: &[u8],
     ) -> Result<AssetId, ConvertError> {
+        // WMF/EMF payloads are unusable in Markdown renderers; the platform
+        // backend (`shared::wmf`) rasterizes them to PNG before retention.
+        // Windows uses GDI + GDI+; other platforms shell out to LibreOffice
+        // when available. Failure of either path degrades to the original
+        // bytes with a warning.
+        let (media_type, origin_part, bytes) = match media_type.as_str() {
+            "image/wmf" | "image/emf" => match crate::shared::wmf::metafile_to_png(bytes) {
+                Some(png) => {
+                    let part = origin_part.rsplit_once('.').map_or_else(
+                        || format!("{origin_part}.png"),
+                        |(stem, _)| format!("{stem}.png"),
+                    );
+                    ("image/png".to_string(), part, png)
+                }
+                None => {
+                    log::warn!("metafile rasterization failed for {origin_part}; keeping original");
+                    (media_type, origin_part, bytes.to_vec())
+                }
+            },
+            _ => (media_type, origin_part, bytes.to_vec()),
+        };
         if let Some(&id) = self.by_part.get(&origin_part) {
             return Ok(id);
         }
@@ -42,7 +63,7 @@ impl AssetSink {
         }
         let id = AssetId(self.assets.len());
         self.by_part.insert(origin_part.clone(), id);
-        self.assets.push(Asset { id, media_type, origin_part, bytes: bytes.to_vec() });
+        self.assets.push(Asset { id, media_type, origin_part, bytes });
         Ok(id)
     }
 }
@@ -123,5 +144,20 @@ mod tests {
         sink.total = limits::MAX_ASSET_TOTAL_BYTES - 10;
         let err = sink.add("image/png".into(), "media/big.png".into(), &[0; 11]).unwrap_err();
         assert!(matches!(err, ConvertError::ResourceLimit { limit: "max_asset_total_bytes", .. }));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn metafile_assets_convert_to_png_at_add_time() {
+        let wmf = include_bytes!("../../tests/fixtures/wmf/asset.wmf").as_slice();
+        let mut sink = AssetSink::new();
+        let a = sink.add("image/wmf".into(), "media/fig1.wmf".into(), wmf).unwrap();
+        let asset = &sink.assets[a.0];
+        assert_eq!(asset.media_type, "image/png");
+        assert_eq!(asset.origin_part, "media/fig1.png");
+        assert!(asset.bytes.starts_with(&[137, 80, 78, 71, 13, 10, 26, 10]));
+        let b = sink.add("image/wmf".into(), "media/fig1.wmf".into(), wmf).unwrap();
+        assert_eq!(a, b, "same origin part must dedup to the converted asset");
+        assert_eq!(sink.assets.len(), 1);
     }
 }

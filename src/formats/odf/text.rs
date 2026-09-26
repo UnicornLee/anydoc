@@ -396,7 +396,13 @@ fn walk_inlines(
                             out.push(Inline::NoteRef(id));
                             continue;
                         }
-                        "annotation" | "tracked-changes" | "soft-page-break" => continue,
+                        "annotation" | "tracked-changes" => continue,
+                        // Where the layout engine broke the page: a free
+                        // pagination mark, kept for document pagination.
+                        "soft-page-break" => {
+                            out.push(Inline::PageBreak);
+                            continue;
+                        }
                         _ => {}
                     }
                 }

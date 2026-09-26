@@ -820,8 +820,22 @@ impl<'a> Parser<'a> {
             }
             // \page and \column break the flow without ending the
             // paragraph; the page they start is unrepresentable, the word
-            // boundary they carry is not.
-            "line" | "lbr" | "page" | "column" => {
+            // boundary they carry is not. \page is kept as a page break so
+            // pagination can split here; \column has no column count to
+            // reason about, so it conservatively stays a line break.
+            "page" => {
+                self.flush_pending();
+                if !self.state.suppress {
+                    if self.state.note.is_some() {
+                        // Inside a note a page mark cannot paginate; it keeps
+                        // the word boundary it carries, as \par does.
+                        self.inlines.push(Inline::LineBreak);
+                    } else {
+                        self.inlines.push(Inline::PageBreak);
+                    }
+                }
+            }
+            "line" | "lbr" | "column" => {
                 self.flush_pending();
                 if !self.state.suppress {
                     self.inlines.push(Inline::LineBreak);
@@ -1350,6 +1364,17 @@ mod tests {
             let markdown = crate::to_markdown_bytes(src.as_bytes(), crate::Format::Rtf).unwrap();
             assert_eq!(markdown, "Alfa\\\nBeta\n", "source: {src}");
         }
+    }
+
+    #[test]
+    fn page_control_splits_pages_but_column_stays_on_one() {
+        let pages =
+            crate::to_pages_bytes(br"{\rtf1 Alfa\page Beta\par}", crate::Format::Rtf).unwrap();
+        assert_eq!(pages, vec!["Alfa\n".to_string(), "Beta\n".to_string()]);
+        // Without a column count \column cannot name a page boundary.
+        let pages =
+            crate::to_pages_bytes(br"{\rtf1 Alfa\column Beta\par}", crate::Format::Rtf).unwrap();
+        assert_eq!(pages, vec!["Alfa\\\nBeta\n".to_string()]);
     }
 
     #[test]

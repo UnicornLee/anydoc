@@ -30,6 +30,10 @@ pub enum Inline {
     Anchor(AnchorId),
     /// A reference to the [`Note`](crate::model::Note) with this id.
     NoteRef(String),
+    /// A page break: the content before and after renders on different
+    /// pages. Renderers without pages (Markdown) treat it as a line break;
+    /// the pagination pass splits the document at it.
+    PageBreak,
     /// A line break inside a block, not a new block.
     LineBreak,
     /// An inline formula, as LaTeX math without delimiters.
@@ -67,7 +71,7 @@ fn collect_plain_text(inlines: &[Inline], out: &mut String) {
             Inline::Image { alt, .. } => out.push_str(alt),
             Inline::Math(tex) => out.push_str(tex),
             Inline::Checkbox(checked) => out.push_str(checkbox_text(*checked)),
-            Inline::Anchor(_) | Inline::NoteRef(_) => {}
+            Inline::Anchor(_) | Inline::NoteRef(_) | Inline::PageBreak => {}
             Inline::LineBreak => out.push('\n'),
         }
     }
@@ -82,6 +86,6 @@ pub fn inlines_are_empty(inlines: &[Inline]) -> bool {
         Inline::Link { content, target } => target.is_empty() && inlines_are_empty(content),
         Inline::Image { .. } | Inline::NoteRef(_) | Inline::Checkbox(_) => false,
         Inline::Math(tex) => tex.trim().is_empty(),
-        Inline::Anchor(_) | Inline::LineBreak => true,
+        Inline::Anchor(_) | Inline::PageBreak | Inline::LineBreak => true,
     })
 }

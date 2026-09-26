@@ -41,6 +41,46 @@ pub fn to_markdown(bytes: &[u8]) -> Result<String, ConvertError> {
     }
 }
 
+/// Convert a PDF to one Markdown string per physical page. Detection
+/// over-reports OCR-needing pages, so a flagged page only errors once
+/// extraction confirms it yielded no text — the same confirmation
+/// [`to_markdown`] performs. Blank physical pages are dropped.
+pub fn to_pages(bytes: &[u8]) -> Result<Vec<String>, ConvertError> {
+    let result = pdf_inspector::process_pdf_mem(bytes).map_err(map_error)?;
+    if result.has_encoding_issues {
+        log::warn!("broken font encodings detected; extracted text may be garbled");
+    }
+    let extracted = pdf_inspector::extract_pages_markdown_mem(bytes, None).map_err(map_error)?;
+    // 1-indexed pages, matching ConvertError::NeedsOcr.
+    let ocr: Vec<u32> = extracted
+        .pages
+        .iter()
+        .filter(|page| page.needs_ocr && page.markdown.trim().is_empty())
+        .map(|page| page.page + 1)
+        .collect();
+    if !ocr.is_empty() {
+        return Err(ConvertError::NeedsOcr { pages: ocr, page_count: result.page_count });
+    }
+    let mut pages: Vec<String> = extracted
+        .pages
+        .into_iter()
+        .map(|page| page.markdown)
+        .filter(|markdown| !markdown.trim().is_empty())
+        .collect();
+    if pages.is_empty() {
+        return Err(ConvertError::Unsupported(format!(
+            "PDF has no extractable text ({:?}, {} pages)",
+            result.pdf_type, result.page_count
+        )));
+    }
+    for markdown in &mut pages {
+        if !markdown.ends_with('\n') {
+            markdown.push('\n');
+        }
+    }
+    Ok(pages)
+}
+
 fn map_error(e: PdfError) -> ConvertError {
     match e {
         PdfError::Encrypted => ConvertError::Encrypted,

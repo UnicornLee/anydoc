@@ -5,12 +5,13 @@
 //! units, matching the CP-indexed PLC structures.
 
 mod lists;
+mod shapes;
 mod sprm;
 mod stsh;
 
 use crate::error::ConvertError;
 use crate::model::{
-    Block, Document, ImageSource, Inline, Note, NoteKind, Style, inlines_are_empty,
+    AssetId, Block, Document, ImageSource, Inline, Note, NoteKind, Style, inlines_are_empty,
     inlines_to_plain_text,
 };
 use crate::package::limits;
@@ -22,10 +23,11 @@ use crate::shared::fields::{FieldFrame, field_result};
 use crate::shared::grid::{CellProp, GridRow, build_edge_table};
 use crate::shared::list::MarkerKind;
 use crate::shared::list::{ListEntry, ListKey, flush_list};
+use crate::shared::math::decode_stream;
 use lists::{LEVELS, ListDef, Lists};
 use sprm::{PapDelta, Tap, apply_chpx, apply_pap_sprms, chpx_istd};
-use std::collections::HashMap;
-use std::io::Cursor;
+use std::collections::{HashMap, VecDeque};
+use std::io::{Cursor, Seek};
 use stsh::Stylesheet;
 
 pub fn parse(bytes: &[u8]) -> Result<Document, ConvertError> {
@@ -33,6 +35,10 @@ pub fn parse(bytes: &[u8]) -> Result<Document, ConvertError> {
     let mut ole = cfb::CompoundFile::open(cursor)
         .map_err(|e| ConvertError::malformed(format!("not an OLE2 compound file: {e}")))?;
 
+    // Embedded equation objects live in the `ObjectPool` storage of this same
+    // compound file. Collect their LaTeX up front so the assembly pass can
+    // substitute a formula for the WMF preview the text stream points at.
+    let equations = ole_equations(&mut ole);
     let word_doc = read_ole_stream(&mut ole, "WordDocument")?;
     if get_u16(&word_doc, 0) != Some(0xA5EC) {
         return Err(ConvertError::malformed_part("WordDocument", "invalid FIB magic".to_string()));
@@ -73,6 +79,19 @@ pub fn parse(bytes: &[u8]) -> Result<Document, ConvertError> {
     let text = extract_text(&word_doc, &pieces, total_cp, encoding);
 
     let data = read_ole_stream(&mut ole, "Data").unwrap_or_default();
+
+    // Floating pictures are anchored to CPs, not carried by a picture
+    // character, so they are resolved to assets here and picked up by the
+    // assembler when it reaches the anchor.
+    let mut assets = AssetSink::new();
+    let mut shape_images: HashMap<usize, AssetId> = HashMap::new();
+    for picture in shapes::parse(&word_doc, &table, &data) {
+        let index = text.index_of_cp(picture.cp as usize);
+        if let Ok(id) = assets.add(picture.media_type, picture.part, &picture.bytes) {
+            shape_images.insert(index, id);
+        }
+    }
+
     let chpx_runs = parse_fkps(&word_doc, &table, 0xFA, FkpKind::Chpx, &data);
     let papx_runs = parse_fkps(&word_doc, &table, 0x102, FkpKind::Papx, &data);
     let stylesheet = stsh::parse(&word_doc, &table);
@@ -112,7 +131,9 @@ pub fn parse(bytes: &[u8]) -> Result<Document, ConvertError> {
         note_refs,
         counters: std::cell::RefCell::new(Counters::default()),
         data,
-        assets: std::cell::RefCell::new(AssetSink::new()),
+        equations: std::cell::RefCell::new(VecDeque::from(equations)),
+        shapes: shape_images,
+        assets: std::cell::RefCell::new(assets),
     };
     let blocks = assembler.build_blocks(0, main_end)?;
     let mut notes = Vec::new();
@@ -598,7 +619,49 @@ struct Assembler {
     counters: std::cell::RefCell<Counters>,
     /// The Data stream, for `sprmCPicLocation` picture payloads.
     data: Vec<u8>,
+    /// Decoded MTEF formulas of the embedded equation objects, taken in
+    /// document order as `EMBED` fields are reached.
+    equations: std::cell::RefCell<VecDeque<String>>,
+    /// Picture assets of the floating shapes, keyed by the char index they are
+    /// anchored to.
+    shapes: HashMap<usize, AssetId>,
     assets: std::cell::RefCell<AssetSink>,
+}
+
+/// Decode the formulas of the OLE objects embedded in a `.doc`.
+///
+/// Word keeps every embedded object in `ObjectPool/_<id>` inside the document's
+/// own OLE2 compound file. Equation objects (`Equation.3`, MathType) expose an
+/// `Equation Native` stream, which is MTEF - `decode_stream` turns it into
+/// LaTeX. Objects are returned in object-id order, i.e. the order Word
+/// assigned them on insertion, which the text stream's `EMBED` fields follow.
+fn ole_equations<R: std::io::Read + Seek>(ole: &mut cfb::CompoundFile<R>) -> Vec<String> {
+    let mut objects: Vec<(u64, String)> = {
+        let Ok(entries) = ole.read_storage("ObjectPool") else {
+            return Vec::new();
+        };
+        entries
+            .filter(|e| e.is_storage())
+            .map(|e| {
+                let id = e.name().trim_start_matches('_').parse::<u64>().unwrap_or(u64::MAX);
+                (id, e.name().to_string())
+            })
+            .collect()
+    };
+    objects.sort();
+    objects
+        .into_iter()
+        .filter_map(|(_, name)| {
+            let dir = format!("ObjectPool/{name}");
+            let stream = ole
+                .read_storage(&dir)
+                .ok()?
+                .find(|e| e.is_stream() && e.name().contains("Equation Native"))
+                .map(|e| e.name().to_string())?;
+            let data = read_ole_stream(ole, &format!("{dir}/{stream}")).ok()?;
+            decode_stream(&data).filter(|tex| !tex.trim().is_empty())
+        })
+        .collect()
 }
 
 /// A paragraph's resolved properties: the style chain's contribution merged
@@ -667,6 +730,16 @@ impl ParaBuilder {
         }
     }
 
+    /// Whether the innermost open field is an `EMBED` field for an equation
+    /// object: its result is only the WMF preview of the formula.
+    fn in_equation_field(&self) -> bool {
+        self.fields.last().is_some_and(|f| {
+            let instr = f.instr.to_ascii_uppercase();
+            instr.trim_start().starts_with("EMBED")
+                && (instr.contains("EQUATION") || instr.contains("DSMT"))
+        })
+    }
+
     fn field_end(&mut self) {
         self.flush_text();
         let Some(frame) = self.fields.pop() else {
@@ -705,6 +778,12 @@ impl Assembler {
         while i < hi.min(self.text.chars.len()) {
             let c = self.text.chars[i];
             let fc = self.text.fcs[i];
+            if let Some(&asset) = self.shapes.get(&i) {
+                para.push_inline(Inline::Image {
+                    alt: String::new(),
+                    source: ImageSource::Asset(asset),
+                });
+            }
             if let Some(id) = self.note_refs.get(&i) {
                 para.push_inline(Inline::NoteRef(id.clone()));
                 i += 1;
@@ -712,6 +791,13 @@ impl Assembler {
             }
             match c {
                 '\r' | '\u{7}' | '\u{c}' | '\u{e}' => {
+                    // 0x0C is a page break: it ends the paragraph like \r,
+                    // and the page boundary is kept for pagination. Inside
+                    // a table cell the paginator drops it (tables are
+                    // atomic), which matches the cell mark's role.
+                    if c == '\u{c}' {
+                        para.push_inline(Inline::PageBreak);
+                    }
                     let pap = self.effective_pap(fc, i);
                     let inlines = std::mem::replace(&mut para, ParaBuilder::new()).finish();
                     let is_cell_mark = c == '\u{7}';
@@ -783,10 +869,18 @@ impl Assembler {
                     para.push_char('-', style);
                 }
                 // Inline picture special character: extract the payload
-                // pointed at by sprmCPicLocation.
+                // pointed at by sprmCPicLocation. An embedded equation is an
+                // `EMBED Equation.3`/`MathType` field whose result is only the
+                // preview image of the formula; prefer the decoded LaTeX.
                 '\u{1}' => {
-                    if let Some(image) = self.picture_at(fc)? {
-                        para.push_inline(image);
+                    let tex = if para.in_equation_field() { self.next_equation() } else { None };
+                    match tex {
+                        Some(tex) => para.push_inline(Inline::Math(tex)),
+                        None => {
+                            if let Some(image) = self.picture_at(fc)? {
+                                para.push_inline(image);
+                            }
+                        }
                     }
                 }
                 '\u{2}' | '\u{5}' | '\u{8}' | '\u{1f}' => {}
@@ -939,6 +1033,11 @@ impl Assembler {
                 blocks.push(Block::Paragraph(inlines));
             }
         }
+    }
+
+    /// Take the next undecoded embedded equation, in document order.
+    fn next_equation(&self) -> Option<String> {
+        self.equations.borrow_mut().pop_front()
     }
 
     /// Extract the inline picture whose PICF + OfficeArt data the character's

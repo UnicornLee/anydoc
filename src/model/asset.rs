@@ -13,6 +13,9 @@ pub struct Asset {
     pub media_type: String,
     /// Package part or stream the asset came from, for provenance.
     pub origin_part: String,
-    /// The payload, exactly as stored in the source.
+    /// The retained payload. Metafile assets (`image/wmf`/`image/emf`) are
+    /// rasterized to PNG on Windows during retention, so `bytes` then holds
+    /// PNG data (and `media_type`/`origin_part` say so); everywhere else the
+    /// payload is exactly as stored in the source.
     pub bytes: Vec<u8>,
 }
